@@ -1,0 +1,65 @@
+func main(std) {
+    let program = ">++++[<++++++++>-]>++++++++[>++++<-]>>++>>>+>>>+<<<<<<<<<<[-[->+<]>[-<+>>>.<<]>>>[[->++++++++[>++++<-]>.<<[->+<]+>[->++++++++++<<+>]>.[-]>]]+<<<[-[->+<]+>[-<+>>>-[->+<]++>[-<->]<<<]<<<<]++++++++++.+++.[-]<]+++++";
+    let size = std.strlen(program);
+    let memory = std.list.with_size(3000, 0);
+    let jump_cache = std.list.with_size(size, -1);
+    let data_ptr = 0;
+    let program_ptr = 0;
+
+    while ((program_ptr != size) && (program_ptr != -1)) {
+        let inst = (program[program_ptr]);
+        let data = (memory[data_ptr]);
+
+        if (inst == "+") {
+            std.list.set(memory, data_ptr, data + 1)
+        } else if(inst == "-") {
+            std.list.set(memory, data_ptr, data - 1)
+        } else if(inst == ">") {
+            let data_ptr = data_ptr + 1
+        } else if(inst == "<") {
+            let data_ptr = data_ptr - 1
+        } else if(inst == ",") {
+            std.list.set(memory, data_ptr, std.ascii_from_char(std.read()))
+        } else if(inst == ".") {
+            std.print(std.char_from_ascii(data))
+        } else if(inst == "[") {
+            if (data == 0) {
+                let program_ptr = find_matching_jump(program_ptr, program, 1, jump_cache)
+            }
+        } else if(inst == "]") {
+            if (data != 0) {
+                let program_ptr = find_matching_jump(program_ptr, program, -1, jump_cache)
+            }
+        };
+
+        let program_ptr = program_ptr + 1
+    }
+}
+
+func find_matching_jump (program_ptr, program, offset, cache) {
+    let cache_val = (cache[program_ptr]);
+    if (cache_val != -1) {
+        return cache_val
+    };
+
+    let og_program_ptr = program_ptr;
+    let program_ptr = program_ptr + offset;
+    let depth = offset;
+    while true {
+        let inst = (program[program_ptr]);
+
+        if (inst == "[") {
+            let depth = depth + 1
+        };
+
+        if (inst == "]") {
+            let depth = depth - 1
+        };
+
+        if ((depth == 0) && ((inst == "[") || (inst == "]"))) {
+            std.list.set(cache, og_program_ptr, program_ptr);
+            return program_ptr
+        };
+        let program_ptr = program_ptr + offset
+    }
+}
