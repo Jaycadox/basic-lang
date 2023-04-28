@@ -1,0 +1,11 @@
+func fib(x) {
+    if (x < 2) {
+        return 1
+    };
+
+    fib(x - 1) + fib(x - 2)
+}
+
+func main() {
+    fib(5)
+}

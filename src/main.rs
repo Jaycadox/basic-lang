@@ -1,3 +1,4 @@
+mod jit;
 mod library;
 mod shared;
 
@@ -12,13 +13,13 @@ fn generate_vars() -> Vec<Expr> {
 
 fn main() {
     let args = shared::Args::get();
-    let ast_out = if args.bytecode {
+    let ast_out = if args.deserialize {
         Ok(bincode::deserialize(&std::fs::read(&args.input).unwrap()).unwrap())
     } else {
         parser().parse(std::fs::read_to_string(&args.input).unwrap())
     };
 
-    if args.compile {
+    if args.serialize {
         if let Ok(expr) = ast_out {
             let bin = bincode::serialize(&expr).unwrap();
             let file_path = format!("{}.compiled", args.input);
@@ -33,13 +34,45 @@ fn main() {
             return;
         }
     }
+    if args.jit {
+        if args.verbose {
+            println!("Using mode: JIT");
+        }
+        if let Expr::Global(gbl) = ast_out.unwrap() {
+            let mut generator = jit::Generator::new(args.verbose);
+            let mut main_func: Option<fn() -> f64> = None;
+            for func in &gbl {
+                if let Expr::Fn { name, .. } = func {
+                    if args.verbose {
+                        println!("> {name} ...");
+                    }
+                    let out = generator.compile(func).unwrap();
+                    if args.verbose {
+                        println!("> {name} 0x{:X}", out as usize);
+                    }
+                    if name == "main" {
+                        unsafe {
+                            let code_fn = std::mem::transmute::<_, fn() -> f64>(out);
+                            main_func = Some(code_fn);
+                        }
+                    }
+                }
+            }
+            if let Some(mfunc) = main_func {
+                let ret = mfunc();
+                println!("Returned: {ret}");
+            } else {
+                panic!("No main function found")
+            }
+        }
+        return;
+    }
 
     let mut vars = Vec::<_>::new();
     match ast_out {
         Ok(ast) => match eval(&ast, &mut vars, &mut Vec::<_>::new(), &mut None) {
-            //Ok(out) => print!("{out:?}"),
+            Ok(out) => println!("Returned: {out:?}"),
             Err(err) => println!("Runtime error: {err}"),
-            _ => {}
         },
         Err(error) => error
             .into_iter()
@@ -119,6 +152,12 @@ fn parser() -> impl Parser<char, Expr, Error = Simple<char>> {
                 .then(expr.clone())
                 .delimited_by(op('('), op(')'))
                 .map(|(lhs, rhs)| Expr::Eq(Box::new(lhs), Box::new(rhs))))
+            .or(expr
+                .clone()
+                .then_ignore(op_str("<").padded())
+                .then(expr.clone())
+                .delimited_by(op('('), op(')'))
+                .map(|(lhs, rhs)| Expr::LessThan(Box::new(lhs), Box::new(rhs))))
             .or(expr
                 .clone()
                 .then_ignore(op_str("!=").padded())
@@ -275,6 +314,14 @@ fn eval<'a>(
             .ok_or("tried to index non indexable item".to_owned()),
         Expr::Eq(lhs, rhs) => {
             return if eval(lhs, vars, funcs, ret)?.string() == eval(rhs, vars, funcs, ret)?.string()
+            {
+                Ok(Value::Number(1.0))
+            } else {
+                Ok(Value::Number(0.0))
+            }
+        }
+        Expr::LessThan(lhs, rhs) => {
+            return if eval(lhs, vars, funcs, ret)?.string() < eval(rhs, vars, funcs, ret)?.string()
             {
                 Ok(Value::Number(1.0))
             } else {

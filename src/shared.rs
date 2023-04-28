@@ -46,9 +46,6 @@ impl Value {
         };
     }
     pub fn index(&self, i: &Self) -> Option<Self> {
-        if !matches!(i, Value::Number(_)) {
-            return None;
-        }
         let i = i.num() as usize;
         return match &self {
             Value::String(n) => Some(Value::String((n.chars().nth(i)).unwrap().to_string())),
@@ -66,6 +63,7 @@ pub enum Expr {
     Neg(Box<Expr>),
     Add(Box<Expr>, Box<Expr>),
     Eq(Box<Expr>, Box<Expr>),
+    LessThan(Box<Expr>, Box<Expr>),
     Index(Box<Expr>, Box<Expr>),
     NotEq(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
@@ -104,13 +102,21 @@ pub struct Args {
     #[arg(short, long)]
     pub input: String,
 
-    /// Compile the file to AST bytecode
+    /// Serialize the file to AST bytecode
     #[arg(short, long, default_value_t = false)]
-    pub compile: bool,
+    pub serialize: bool,
 
-    /// Run a script from AST bytecode
+    /// Deserialize a script from AST bytecode
     #[arg(short, long, default_value_t = false)]
-    pub bytecode: bool,
+    pub deserialize: bool,
+
+    /// Experimental JIT compiler
+    #[arg(short, long, default_value_t = false)]
+    pub jit: bool,
+
+    /// Verbose logging
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 impl Args {
