@@ -3,6 +3,7 @@ mod library;
 mod shared;
 
 use chumsky::prelude::*;
+use iced_x86::{Formatter, Decoder, DecoderOptions, NasmFormatter, Instruction};
 use shared::*;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -41,15 +42,36 @@ fn main() {
         if let Expr::Global(gbl) = ast_out.unwrap() {
             let mut generator = jit::Generator::new(args.verbose);
             let mut main_func: Option<fn() -> f64> = None;
+
             for func in &gbl {
                 if let Expr::Fn { name, .. } = func {
                     if args.verbose {
                         println!("> {name} ...");
                     }
-                    let out = generator.compile(func).unwrap();
+                    let (out, size) = generator.compile(func).unwrap();
                     if args.verbose {
-                        println!("> {name} 0x{:X}", out as usize);
+                        println!("> {name} 0x{:X} | {} bytes", out as usize, size);
                     }
+
+                    if args.verbose {
+                        println!("> Disassembly (given x86-64):");
+                        unsafe {
+                            let data = std::slice::from_raw_parts(out.clone(), size as usize);
+                            let mut decoder = Decoder::with_ip(64, data, out.clone() as u64, DecoderOptions::NONE);
+
+                            let mut formatter = NasmFormatter::new();
+                            let mut output = String::new();
+                            
+                            let mut instruction = Instruction::new();
+                            while decoder.can_decode() {
+                                output.clear();
+                                decoder.decode_out(&mut instruction);
+                                formatter.format(&instruction, &mut output);
+                                println!(">>    {}", output);
+                            }
+                        }
+                    }
+
                     if name == "main" {
                         unsafe {
                             let code_fn = std::mem::transmute::<_, fn() -> f64>(out);
@@ -321,7 +343,7 @@ fn eval<'a>(
             }
         }
         Expr::LessThan(lhs, rhs) => {
-            return if eval(lhs, vars, funcs, ret)?.string() < eval(rhs, vars, funcs, ret)?.string()
+            return if eval(lhs, vars, funcs, ret)?.num() < eval(rhs, vars, funcs, ret)?.num()
             {
                 Ok(Value::Number(1.0))
             } else {

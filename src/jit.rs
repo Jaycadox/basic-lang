@@ -20,6 +20,10 @@ impl Generator {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        flag_builder.set("opt_level", "speed_and_size").unwrap();
+        flag_builder.set("enable_simd", "true").unwrap();
+        flag_builder.set("enable_alias_analysis", "true").unwrap();
+        flag_builder.set("preserve_frame_pointers", "false").unwrap();
         let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
             panic!("host machine is not supported: {}", msg);
         });
@@ -36,7 +40,7 @@ impl Generator {
             verbose
         }
     }
-    pub fn compile(&mut self, expr: &Expr) -> Result<*const u8, String> {
+    pub fn compile(&mut self, expr: &Expr) -> Result<(*const u8, u32), String> {
         match expr {
             Expr::Fn { name, .. } => {
                 if self.verbose {
@@ -52,17 +56,17 @@ impl Generator {
                     .declare_function(&name, Linkage::Export, &self.ctx.func.signature)
                     .map_err(|e| e.to_string())?;
 
-                self.module
+                let func = self.module
                     .define_function(id, &mut self.ctx)
                     .map_err(|e| e.to_string())?;
+
                 self.module.clear_context(&mut self.ctx);
 
                 self.module.finalize_definitions().unwrap();
 
                 let code = self.module.get_finalized_function(id);
                 
-
-                Ok(code)
+                Ok((code, func.size))
             }
             _ => {
                 panic!("JIT: attempt to compile non-function")
@@ -453,7 +457,7 @@ impl<'a> FunctionTranslator<'a> {
             }
             Expr::ExpressionList(exprs, ret) => {
                 if self.verbose {
-                    println!(">> Expression list with count: {}", exprs.len() + 1);
+                    println!(">>> Expression list with count: {}", exprs.len() + 1);
                 }
                 for e in exprs {
                     self.translate_expr(e);
