@@ -5,17 +5,78 @@ fn generate_vars() -> Vec<Expr> {
     vec![Expr::Identifier(crate::library::generate_library())]
 }
 
+pub struct State {
+    vars: Vec<(String, Value)>,
+    funcs: Vec<Expr>,
+    ret: Option<Value>,
+    limited_enviorment: bool,
+    ticks: (u64, u64)
+}
+
+impl State {
+    pub fn new() -> Self {
+        Self {
+            vars: Vec::new(),
+            funcs: Vec::new(),
+            ret: None,
+            limited_enviorment: false,
+            ticks: (0, 0)
+        }
+    }
+
+    pub fn limited_enviorment(max_ticks: u64) -> Self {
+        Self {
+            vars: Vec::new(),
+            funcs: Vec::new(),
+            ret: None,
+            limited_enviorment: true,
+            ticks: (0, max_ticks)
+        }
+    }
+}
+
+pub fn eval_repl<'a>(
+    mut expr: Expr,
+    repl: Expr,
+    state: &'a mut State,
+    jit: bool
+) -> Result<Value, String> {
+
+    if let Expr::Global(gbl) = &mut expr {
+        for expr in gbl {
+            if let Expr::Fn { name, body, .. } = expr {
+                if name == "main" {
+                    *body = Box::new(repl);
+                    break;
+                }
+            }
+        }
+        if jit {
+            return crate::shared::run_jit(expr.clone(), false, false, false);
+        }
+
+        return eval(&expr.clone(), state);
+    }
+    Err("eval_repl expects root to be Global".into())
+}
+
 pub fn eval<'a>(
     expr: &'a Expr,
-    vars: &mut Vec<(String, Value)>,
-    funcs: &mut Vec<&'a Expr>,
-    ret: &mut Option<Value>,
+    state: &'a mut State
 ) -> Result<Value, String> {
-    //println!("{vars:#?}");
+    
+    if state.limited_enviorment {
+        if state.ticks.0 >= state.ticks.1 {
+            return Err("Too many ticks!".into());
+        }
+    }
+
+    state.ticks.0 += 1;
+
     match expr {
         Expr::Global(exprs) => {
             for expr in exprs {
-                eval(expr, vars, funcs, ret)?;
+                eval(expr, state)?;
             }
             let call = Expr::Call(
                 Box::new(Expr::Property(
@@ -24,28 +85,33 @@ pub fn eval<'a>(
                 )),
                 generate_vars(),
             );
-            eval(&call, &mut vars.clone(), &mut funcs.clone(), ret)
+            let vars = state.vars.clone();
+            let funcs = state.funcs.clone();
+            let ret = state.ret.clone();
+            let limited_enviorment = state.limited_enviorment;
+            let ticks = state.ticks;
+            eval(&call, &mut State { vars , funcs, ret, limited_enviorment, ticks })
         }
         Expr::Fn { .. } => {
-            funcs.push(expr);
+            state.funcs.push(expr.clone());
             Ok(Value::String("function".to_owned()))
         }
         Expr::Return(expr) => {
-            let ret_val = eval(expr, vars, funcs, ret)?;
-            *ret = Some(ret_val.clone());
+            let ret_val = eval(expr, state)?;
+            state.ret = Some(ret_val.clone());
             return Ok(ret_val);
         }
         Expr::List(items) => {
             let item_values = items
                 .iter()
-                .map(|i| eval(i, vars, funcs, ret).unwrap().clone());
+                .map(|i| eval(i, state).unwrap().clone());
             Ok(Value::List(Arc::new(Mutex::new(item_values.collect()))))
         }
-        Expr::Index(val, i) => eval(val, vars, funcs, ret)?
-            .index(&eval(i, vars, funcs, ret)?)
+        Expr::Index(val, i) => eval(val, state)?
+            .index(&eval(i, state)?)
             .ok_or("tried to index non indexable item".to_owned()),
         Expr::Eq(lhs, rhs) => {
-            return if eval(lhs, vars, funcs, ret)?.string() == eval(rhs, vars, funcs, ret)?.string()
+            return if eval(lhs, state)?.string() == eval(rhs, state)?.string()
             {
                 Ok(Value::Number(1.0))
             } else {
@@ -53,22 +119,22 @@ pub fn eval<'a>(
             }
         }
         Expr::LessThan(lhs, rhs) => {
-            return if eval(lhs, vars, funcs, ret)?.num() < eval(rhs, vars, funcs, ret)?.num()
+            return if eval(lhs, state)?.num() < eval(rhs, state)?.num()
             {
                 Ok(Value::Number(1.0))
             } else {
                 Ok(Value::Number(0.0))
             }
         }
-        Expr::Not(val) => Ok(Value::Boolean(!eval(val, vars, funcs, ret)?.is_true())),
+        Expr::Not(val) => Ok(Value::Boolean(!eval(val, state)?.is_true())),
         Expr::And(lhs, rhs) => Ok(Value::Boolean(
-            eval(lhs, vars, funcs, ret)?.is_true() && eval(rhs, vars, funcs, ret)?.is_true(),
+            eval(lhs, state)?.is_true() && eval(rhs, state)?.is_true(),
         )),
         Expr::Or(lhs, rhs) => Ok(Value::Boolean(
-            eval(lhs, vars, funcs, ret)?.is_true() || eval(rhs, vars, funcs, ret)?.is_true(),
+            eval(lhs, state)?.is_true() || eval(rhs, state)?.is_true(),
         )),
         Expr::NotEq(lhs, rhs) => {
-            return if eval(lhs, vars, funcs, ret)?.string() != eval(rhs, vars, funcs, ret)?.string()
+            return if eval(lhs, state)?.string() != eval(rhs, state)?.string()
             {
                 Ok(Value::Number(1.0))
             } else {
@@ -77,9 +143,13 @@ pub fn eval<'a>(
         }
         Expr::Identifier(name) => Ok(name.to_owned()),
         Expr::Property(obj, property) => {
-            let obj_name = eval(obj, vars, funcs, ret)?.string();
+            if property.len() != 0 && state.limited_enviorment {
+                return Err("Attempt to access external property from limited enviorment".into());
+            }
 
-            for func in funcs.iter() {
+            let obj_name = eval(obj, state)?.string();
+
+            for func in state.funcs.iter() {
                 match func {
                     Expr::Fn { name, .. } => {
                         if name == &obj_name {
@@ -89,7 +159,7 @@ pub fn eval<'a>(
                     _ => {}
                 }
             }
-            for (name, val) in vars.iter().rev() {
+            for (name, val) in state.vars.iter().rev() {
                 if *name == obj_name {
                     if property.len() != 0 {
                         if !matches!(val, Value::ExternalFunctionLibrary(_)) {
@@ -104,12 +174,12 @@ pub fn eval<'a>(
                 }
             }
 
-            for (name, val) in vars.iter() {
+            for (name, val) in state.vars.iter() {
                 if *name == obj_name {
                     if let Value::ExternalFunctionLibrary(lib) = val.clone() {
                         let key = property
                             .iter()
-                            .map(|e| eval(e, vars, funcs, ret).unwrap().string())
+                            .map(|e| eval(e, state).unwrap().string())
                             .collect::<Vec<String>>();
                         if lib.contains_key(&key) {
                             let func = lib[&key].clone();
@@ -128,24 +198,24 @@ pub fn eval<'a>(
             ))
         }
         Expr::Call(name, args) => {
-            let mut old_vars = vars.clone();
+            let old_vars = state.vars.clone();
             let fn_name = name;
             let fn_args_len = args.len();
             let fn_args = args;
 
-            let func_result = eval(fn_name, vars, funcs, ret)?;
+            let func_result = eval(fn_name, state)?;
             match func_result {
                 Value::ExternalFunction(efunc) => {
                     return efunc(
                         args.iter()
-                            .map(|e| eval(e, vars, funcs, ret).unwrap())
+                            .map(|e| eval(e, state).unwrap())
                             .collect(),
                     );
                 }
                 Value::Function(func) => match *func {
                     Expr::Fn { name, .. } => {
                         let nfunc_name = name;
-                        for func in funcs.clone() {
+                        for func in state.funcs.clone() {
                             match func {
                                 Expr::Fn { name, args, body } => {
                                     if *name != nfunc_name {
@@ -153,14 +223,15 @@ pub fn eval<'a>(
                                     }
 
                                     for (arg_name, arg_expr) in std::iter::zip(args, fn_args) {
-                                        vars.push((
+                                        let val = eval(arg_expr, state)?.clone();
+                                        state.vars.push((
                                             arg_name.to_owned(),
-                                            eval(arg_expr, &mut old_vars, funcs, ret)?,
+                                            val,
                                         ));
                                     }
-                                    let result = eval(body, vars, funcs, ret);
-                                    *ret = None;
-                                    *vars = old_vars;
+                                    let result = eval(&body, state);
+                                    state.ret = None;
+                                    state.vars = old_vars;
                                     return result;
                                 }
                                 _ => {}
@@ -182,60 +253,60 @@ pub fn eval<'a>(
             body,
             else_,
         } => {
-            let res = eval(&condition, vars, funcs, ret)?;
+            let res = eval(&condition, state)?;
             if res.is_true() {
-                return eval(&body, vars, funcs, ret);
+                return eval(&body, state);
             }
             if let Some(else_block) = else_ {
-                return eval(&else_block, vars, funcs, ret);
+                return eval(&else_block, state);
             }
 
             Ok(Value::Number(0.0))
         }
 
         Expr::While { condition, body } => {
-            while eval(&condition, vars, funcs, ret)?.is_true() {
-                eval(&body, vars, funcs, ret)?;
-                if let Some(val) = ret {
+            while eval(&condition, state)?.is_true() {
+                eval(&body, state)?;
+                if let Some(val) = &state.ret {
                     return Ok(val.to_owned());
                 }
             }
             Ok(Value::Number(0.0))
         }
 
-        Expr::Neg(a) => Ok(Value::Number(-eval(a, vars, funcs, ret)?.num())),
+        Expr::Neg(a) => Ok(Value::Number(-eval(a, state)?.num())),
         Expr::Add(a, b) => Ok(Value::Number(
-            eval(a, vars, funcs, ret)?.num() + eval(b, vars, funcs, ret)?.num(),
+            eval(a, state)?.num() + eval(b, state)?.num(),
         )),
         Expr::Sub(a, b) => Ok(Value::Number(
-            eval(a, vars, funcs, ret)?.num() - eval(b, vars, funcs, ret)?.num(),
+            eval(a, state)?.num() - eval(b, state)?.num(),
         )),
         Expr::Mul(a, b) => Ok(Value::Number(
-            eval(a, vars, funcs, ret)?.num() * eval(b, vars, funcs, ret)?.num(),
+            eval(a, state)?.num() * eval(b, state)?.num(),
         )),
         Expr::Div(a, b) => Ok(Value::Number(
-            eval(a, vars, funcs, ret)?.num() / eval(b, vars, funcs, ret)?.num(),
+            eval(a, state)?.num() / eval(b, state)?.num(),
         )),
         Expr::Let { name, rhs } => {
-            let rhs = eval(rhs, vars, funcs, ret)?;
-            vars.push((name.to_owned(), rhs.clone()));
+            let rhs = eval(rhs, state)?;
+            state.vars.push((name.to_owned(), rhs.clone()));
             Ok(rhs)
         }
         Expr::ExpressionList(list, then) => {
             for expr in list {
                 match expr {
                     Expr::Return(expr) => {
-                        return eval(expr, vars, funcs, ret);
+                        return eval(expr, state);
                     }
                     _ => {
-                        eval(expr, vars, funcs, ret)?;
-                        if ret.is_some() {
-                            return Ok(ret.clone().unwrap());
+                        eval(expr, state)?;
+                        if state.ret.is_some() {
+                            return Ok(state.ret.clone().unwrap());
                         }
                     }
                 }
             }
-            eval(then, vars, funcs, ret)
+            eval(then, state)
         }
     }
 }

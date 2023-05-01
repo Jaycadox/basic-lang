@@ -7,5 +7,5 @@ fib x = {
 }
 
 func main() {
-    fib(30)
+    fib(23)
 }

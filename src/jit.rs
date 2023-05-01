@@ -6,17 +6,20 @@ use cranelift::prelude::{FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
+use crate::interpreter;
 use crate::shared::Expr;
 
 pub struct Generator {
     builder_context: FunctionBuilderContext,
     ctx: codegen::Context,
     module: JITModule,
-    verbose: bool
+    verbose: bool,
+    evaluate_constants: bool,
+    jit_evaluate_constants: bool,
 }
 
 impl Generator {
-    pub fn new(verbose: bool) -> Self {
+    pub fn new(verbose: bool, evaluate_constants: bool, jit_evaluate_constants: bool) -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
@@ -37,19 +40,20 @@ impl Generator {
             builder_context: FunctionBuilderContext::new(),
             ctx: module.make_context(),
             module,
-            verbose
+            verbose,
+            evaluate_constants,
+            jit_evaluate_constants
         }
     }
-    pub fn compile(&mut self, expr: &Expr) -> Result<(*const u8, u32), String> {
+    pub fn compile(&mut self, expr: &Expr, full_ast: Expr) -> Result<(*const u8, u32), String> {
         match expr {
             Expr::Fn { name, .. } => {
                 if self.verbose {
                     println!("> Building IR...");
                 }
 
-
                 // TODO: translate function AST into cranelift IR
-                self.translate(expr)?;
+                self.translate(expr, full_ast)?;
 
                 let id = self
                     .module
@@ -74,7 +78,7 @@ impl Generator {
         }
     }
 
-    fn translate(&mut self, func: &Expr) -> Result<(), String> {
+    fn translate(&mut self, func: &Expr, full_ast: Expr) -> Result<(), String> {
         match func {
             Expr::Fn { args, body, .. } => {
                 if self.verbose {
@@ -116,14 +120,18 @@ impl Generator {
                     variables,
                     module: &mut self.module,
                     just_returned: false,
-                    verbose: self.verbose
+                    verbose: self.verbose,
+                    evaluate_constants: self.evaluate_constants,
+                    root_ast: full_ast,
+                    expression_cache: HashMap::new(),
+                    jit_evaluate_constants: self.jit_evaluate_constants,
                 };
                 
                 if self.verbose {
                     println!(">> Generating code...")
                 }
 
-                let ret = trans.translate_expr(*body.clone());
+                let ret = trans.translate_expr(*body.clone())?;
                 if !trans.just_returned {
                     trans.builder.ins().return_(&[ret]);
                 }
@@ -295,23 +303,29 @@ struct FunctionTranslator<'a> {
     int: types::Type,
     builder: FunctionBuilder<'a>,
     variables: HashMap<String, Variable>,
+    expression_cache: HashMap<String, f64>,
     module: &'a mut JITModule,
     just_returned: bool,
-    verbose: bool
+    verbose: bool,
+    evaluate_constants: bool,
+    jit_evaluate_constants: bool,
+    root_ast: Expr
 }
 
 impl<'a> FunctionTranslator<'a> {
-    fn translate_expr(&mut self, expr: Expr) -> Value {
+    fn translate_expr(&mut self, expr: Expr) -> Result<Value, String> {
         self.just_returned = false;
+        let expr_clone = expr.clone();
+
         match expr {
             Expr::Identifier(id) => match id {
-                crate::shared::Value::Number(x) => self.builder.ins().f64const(x),
+                crate::shared::Value::Number(x) => Ok(self.builder.ins().f64const(x)),
                 crate::shared::Value::String(name) => {
                     let variable = self
                         .variables
                         .get(&name)
-                        .expect("attempt to get undefined variable");
-                    self.builder.use_var(*variable)
+                        .ok_or("attempt to get undefined variable")?;
+                    Ok(self.builder.use_var(*variable))
                 }
                 _ => panic!("JIT: Only supports numeric literals and variables"),
             },
@@ -324,64 +338,106 @@ impl<'a> FunctionTranslator<'a> {
             }
             Expr::List(_) => todo!("JIT: lists are unsupported"),
             Expr::Neg(e) => {
-                let val = self.translate_expr(*e);
+                let val = self.translate_expr(*e)?;
                 let neg1 = self.builder.ins().f64const(-1.0);
 
-                self.builder.ins().fmul(val, neg1)
+                Ok(self.builder.ins().fmul(val, neg1))
             }
             Expr::Add(lhs, rhs) => {
-                let lhs = self.translate_expr(*lhs);
-                let rhs = self.translate_expr(*rhs);
+                if let Some(val) = self.try_interpret(expr_clone) {
+                    return Ok(val);
+                }
 
-                self.builder.ins().fadd(lhs, rhs)
+                let lhs = self.translate_expr(*lhs)?;
+                let rhs = self.translate_expr(*rhs)?;
+
+                Ok(self.builder.ins().fadd(lhs, rhs))
             }
-            Expr::Eq(lhs, rhs) => self.fcmp(FloatCC::Equal, *lhs, *rhs),
-            Expr::LessThan(lhs, rhs) => self.fcmp(FloatCC::LessThan, *lhs, *rhs),
+            Expr::Eq(lhs, rhs) => {
+                if let Some(val) = self.try_interpret(expr_clone.clone()) {
+                    return Ok(val);
+                }
+
+                Ok(self.fcmp(FloatCC::Equal, *lhs, *rhs)?)
+            },
+            Expr::LessThan(lhs, rhs) => {
+                if let Some(val) = self.try_interpret(expr_clone.clone()) {
+                    return Ok(val);
+                }
+
+                Ok(self.fcmp(FloatCC::LessThan, *lhs, *rhs)?)
+            },
             Expr::Index(_, _) => todo!("JIT: index not supported"),
-            Expr::NotEq(lhs, rhs) => self.fcmp(FloatCC::NotEqual, *lhs, *rhs),
+            Expr::NotEq(lhs, rhs) => {
+                if let Some(val) = self.try_interpret(expr_clone.clone()) {
+                    return Ok(val);
+                }
+
+                Ok(self.fcmp(FloatCC::NotEqual, *lhs, *rhs)?)
+            },
             Expr::Not(e) => {
                 // This is branchless, and works on floats, so it isn't perfect, the value really has to be either 0 or 1, but we can't check this
-                let e = self.translate_expr(*e);
+                let e = self.translate_expr(*e)?;
                 let one = self.builder.ins().f64const(1.0);
 
-                self.builder.ins().fsub(one, e)
+                Ok(self.builder.ins().fsub(one, e))
             }
             Expr::And(lhs, rhs) => {
-                let (lhs, rhs) = self.bools(*lhs, *rhs);
+                if let Some(val) = self.try_interpret(expr_clone) {
+                    return Ok(val);
+                }
+
+                let (lhs, rhs) = self.bools(*lhs, *rhs)?;
                 let res = self.builder.ins().band(lhs, rhs);
 
-                self.builder.ins().fcvt_from_uint(types::F64, res)
+                Ok(self.builder.ins().fcvt_from_uint(types::F64, res))
             }
             Expr::Or(lhs, rhs) => {
-                let (lhs, rhs) = self.bools(*lhs, *rhs);
+                if let Some(val) = self.try_interpret(expr_clone) {
+                    return Ok(val);
+                }
+
+                let (lhs, rhs) = self.bools(*lhs, *rhs)?;
                 let res = self.builder.ins().bor(lhs, rhs);
 
-                self.builder.ins().fcvt_from_uint(types::F64, res)
+                Ok(self.builder.ins().fcvt_from_uint(types::F64, res))
             }
             Expr::Sub(lhs, rhs) => {
-                let lhs = self.translate_expr(*lhs);
-                let rhs = self.translate_expr(*rhs);
+                if let Some(val) = self.try_interpret(expr_clone) {
+                    return Ok(val);
+                }
 
-                self.builder.ins().fsub(lhs, rhs)
+                let lhs = self.translate_expr(*lhs)?;
+                let rhs = self.translate_expr(*rhs)?;
+
+                Ok(self.builder.ins().fsub(lhs, rhs))
             }
             Expr::Mul(lhs, rhs) => {
-                let lhs = self.translate_expr(*lhs);
-                let rhs = self.translate_expr(*rhs);
+                if let Some(val) = self.try_interpret(expr_clone) {
+                    return Ok(val);
+                }
 
-                self.builder.ins().fmul(lhs, rhs)
+                let lhs = self.translate_expr(*lhs)?;
+                let rhs = self.translate_expr(*rhs)?;
+
+                Ok(self.builder.ins().fmul(lhs, rhs))
             }
             Expr::Div(lhs, rhs) => {
-                let lhs = self.translate_expr(*lhs);
-                let rhs = self.translate_expr(*rhs);
+                if let Some(val) = self.try_interpret(expr_clone) {
+                    return Ok(val);
+                }
 
-                self.builder.ins().fdiv(lhs, rhs)
+                let lhs = self.translate_expr(*lhs)?;
+                let rhs = self.translate_expr(*rhs)?;
+
+                Ok(self.builder.ins().fdiv(lhs, rhs))
             }
             Expr::If {
                 condition,
                 body,
                 else_,
             } => {
-                let condition_value = self.bool(*condition);
+                let condition_value = self.bool(*condition)?;
                 let then_block = self.builder.create_block();
                 let else_block = self.builder.create_block();
                 let merge_block = self.builder.create_block();
@@ -393,7 +449,7 @@ impl<'a> FunctionTranslator<'a> {
                     .brif(condition_value, then_block, &[], else_block, &[]);
                 self.builder.switch_to_block(then_block);
                 self.builder.seal_block(then_block);
-                let then_return = self.translate_expr(*body);
+                let then_return = self.translate_expr(*body)?;
 
                 if !self.just_returned {
                     self.builder.ins().jump(merge_block, &[then_return]);
@@ -407,7 +463,7 @@ impl<'a> FunctionTranslator<'a> {
                 self.just_returned = false;
 
                 if let Some(else_) = else_ {
-                    else_return = self.translate_expr(*else_);
+                    else_return = self.translate_expr(*else_)?;
                 }
 
                 if !self.just_returned {
@@ -418,7 +474,7 @@ impl<'a> FunctionTranslator<'a> {
 
                 let phi = self.builder.block_params(merge_block)[0];
 
-                phi
+                Ok(phi)
             }
             Expr::While { condition, body } => {
                 let header_block = self.builder.create_block();
@@ -428,7 +484,7 @@ impl<'a> FunctionTranslator<'a> {
                 self.builder.ins().jump(header_block, &[]);
                 self.builder.switch_to_block(header_block);
 
-                let condition_value = self.bool(*condition);
+                let condition_value = self.bool(*condition)?;
                 self.builder
                     .ins()
                     .brif(condition_value, body_block, &[], exit_block, &[]);
@@ -450,22 +506,26 @@ impl<'a> FunctionTranslator<'a> {
                 ret
             }
             Expr::Return(ret) => {
-                let val = self.translate_expr(*ret);
+                let val = self.translate_expr(*ret)?;
                 self.builder.ins().return_(&[val]);
                 self.just_returned = true;
-                val
+                Ok(val)
             }
             Expr::ExpressionList(exprs, ret) => {
                 if self.verbose {
                     println!(">>> Expression list with count: {}", exprs.len() + 1);
                 }
                 for e in exprs {
-                    self.translate_expr(e);
+                    self.translate_expr(e)?;
                 }
 
                 self.translate_expr(*ret)
             }
             Expr::Call(e, args) => {
+                if let Some(val) = self.try_interpret(expr_clone) {
+                    return Ok(val);
+                }
+
                 if let crate::Expr::Property(prefix, _) = *e {
                     if let crate::Expr::Identifier(id) = *prefix {
                         if let crate::Value::String(name) = id {
@@ -482,24 +542,24 @@ impl<'a> FunctionTranslator<'a> {
 
                             let mut arg_values = Vec::new();
                             for arg in args {
-                                arg_values.push(self.translate_expr(arg));
+                                arg_values.push(self.translate_expr(arg)?);
                             }
 
                             let call = self.builder.ins().call(local_calle, &arg_values);
-                            return self.builder.inst_results(call)[0];
+                            return Ok(self.builder.inst_results(call)[0]);
                         }
                     }
                 }
                 panic!("JIT: Cannot dynamically call functions")
             },
             Expr::Let { name, rhs } => {
-                let value = self.translate_expr(*rhs);
+                let value = self.translate_expr(*rhs)?;
                 let variable = self
                     .variables
                     .get(&name)
                     .expect("JIT: internal error, variable not found. Should not happen");
                 self.builder.def_var(*variable, value);
-                value
+                Ok(value)
             }
             Expr::Fn { .. } => {
                 panic!("JIT: function expr should not be JIT compiled directly")
@@ -508,17 +568,40 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 
-    fn fcmp(&mut self, compare: FloatCC, lhs: Expr, rhs: Expr) -> Value {
-        let lhs = self.translate_expr(lhs);
-        let rhs = self.translate_expr(rhs);
-        let res = self.builder.ins().fcmp(compare, lhs, rhs);
+    fn try_interpret(&mut self, expr: Expr) -> Option<Value> {
+        if !self.evaluate_constants {
+            return None;
+        }
 
-        self.builder.ins().fcvt_from_uint(types::F64, res)
+        if let Some(num) = self.expression_cache.get(&format!("{expr:?}")) {
+            return Some(self.builder.ins().f64const(*num));
+        }
+
+        let eval = interpreter::eval_repl(self.root_ast.clone(), expr.clone(), &mut interpreter::State::limited_enviorment(800000), self.jit_evaluate_constants);
+        if let Ok(val) = eval {
+            // Currently only numbers are supported
+            if let crate::shared::Value::Number(num) = val {
+                self.expression_cache.insert(format!("{expr:?}"), num);
+                if self.verbose {
+                    println!(">>> Pre-evaluated expression {expr:?}: {num}")
+                }
+                return Some(self.builder.ins().f64const(num));
+            }
+        }
+        None
     }
 
-    fn bools(&mut self, lhs: Expr, rhs: Expr) -> (Value, Value) {
-        let lhs = self.translate_expr(lhs);
-        let rhs = self.translate_expr(rhs);
+    fn fcmp(&mut self, compare: FloatCC, lhs: Expr, rhs: Expr) -> Result<Value, String> {
+        let lhs = self.translate_expr(lhs)?;
+        let rhs = self.translate_expr(rhs)?;
+        let res = self.builder.ins().fcmp(compare, lhs, rhs);
+
+        Ok(self.builder.ins().fcvt_from_uint(types::F64, res))
+    }
+
+    fn bools(&mut self, lhs: Expr, rhs: Expr) -> Result<(Value, Value), String> {
+        let lhs = self.translate_expr(lhs)?;
+        let rhs = self.translate_expr(rhs)?;
 
         let lval = self.builder.ins().fcvt_to_uint(types::I64, lhs);
         let rval = self.builder.ins().fcvt_to_uint(types::I64, rhs);
@@ -528,15 +611,15 @@ impl<'a> FunctionTranslator<'a> {
         let compare_1 = self.builder.ins().icmp(IntCC::Equal, lval, const_one);
         let compare_2 = self.builder.ins().icmp(IntCC::Equal, rval, const_one);
 
-        (compare_1, compare_2)
+        Ok((compare_1, compare_2))
     }
 
-    fn bool(&mut self, lhs: Expr) -> Value {
-        let lhs = self.translate_expr(lhs);
+    fn bool(&mut self, lhs: Expr) -> Result<Value, String> {
+        let lhs = self.translate_expr(lhs)?;
         let lval = self.builder.ins().fcvt_to_uint(types::I64, lhs);
         let const_one = self.builder.ins().iconst(types::I64, 1);
         let compare = self.builder.ins().icmp(IntCC::Equal, lval, const_one);
 
-        compare
+        Ok(compare)
     }
 }

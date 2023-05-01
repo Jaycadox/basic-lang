@@ -1,6 +1,7 @@
 use clap::Parser;
 use serde_derive::*;
 use std::sync::{Arc, Mutex};
+use iced_x86::{Formatter, Decoder, DecoderOptions, NasmFormatter, Instruction};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Value {
@@ -109,10 +110,81 @@ pub struct Args {
     /// Verbose logging
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,
+
+    /// Evaluate constants during compilation for JIT, much slower compile time, faster run time
+    #[arg(short, long, default_value_t = false)]
+    pub evaluate_constants: bool,
+
+    /// Evaluate constants using JIT for JIT, slower compile time, faster run time
+    #[arg(short, long, default_value_t = false)]
+    pub meta_jit_evaluate_constants: bool,
 }
 
 impl Args {
     pub fn get() -> Self {
         Self::parse()
     }
+}
+
+pub fn run_jit(ast: Expr, verbose: bool, eval_constants: bool, jit_evaluate_constants: bool) -> Result<Value, String> {
+    let ast_clone = ast.clone();
+    if verbose {
+        println!("Using mode: JIT");
+    }
+    if let Expr::Global(gbl) = ast {
+        let mut generator = crate::jit::Generator::new(verbose, eval_constants, jit_evaluate_constants);
+        let mut main_func: Option<fn() -> f64> = None;
+
+        for func in &gbl {
+            if let Expr::Fn { name, .. } = func {
+                if verbose {
+                    println!("> {name} ...");
+                }
+                let (out, size) = generator.compile(func, ast_clone.clone())?;
+                if verbose {
+                    println!("> {name} 0x{:X} | {} bytes", out as usize, size);
+                }
+
+                if verbose {
+                    println!("> Disassembly (given x86-64):");
+                    unsafe {
+                        let data = std::slice::from_raw_parts(out.clone(), size as usize);
+                        let mut decoder = Decoder::with_ip(64, data, out.clone() as u64, DecoderOptions::NONE);
+
+                        let mut formatter = NasmFormatter::new();
+                        let mut output = String::new();
+                        
+                        let mut instruction = Instruction::new();
+                        while decoder.can_decode() {
+                            output.clear();
+                            decoder.decode_out(&mut instruction);
+                            formatter.format(&instruction, &mut output);
+                            println!(">>    {}", output);
+                        }
+                    }
+                }
+
+                if name == "main" {
+                    unsafe {
+                        let code_fn = std::mem::transmute::<_, fn() -> f64>(out);
+                        main_func = Some(code_fn);
+                    }
+                }
+            }
+        }
+        if let Some(mfunc) = main_func {
+            let ret = mfunc();
+            return Ok(Value::Number(ret));
+        } else {
+            panic!("No main function found")
+        }
+    }
+    panic!("JIT failed")
+}
+
+pub fn run_interpreted(ast: Expr) -> Value {
+    match crate::interpreter::eval(&ast, &mut crate::interpreter::State::new()) {
+            Ok(out) => return out,
+            Err(err) => panic!("Runtime error: {err}"),
+    };
 }
