@@ -102,14 +102,6 @@ pub struct Args {
     #[arg(short, long)]
     pub input: String,
 
-    /// Serialize the file to AST bytecode
-    #[arg(short, long, default_value_t = false)]
-    pub serialize: bool,
-
-    /// Deserialize a script from AST bytecode
-    #[arg(short, long, default_value_t = false)]
-    pub deserialize: bool,
-
     /// Experimental JIT compiler
     #[arg(short, long, default_value_t = false)]
     pub jit: bool,
